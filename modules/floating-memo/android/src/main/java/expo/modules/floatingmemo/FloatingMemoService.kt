@@ -3,6 +3,7 @@ package expo.modules.floatingmemo
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -21,6 +22,7 @@ class FloatingMemoService : Service() {
   companion object {
     private const val CHANNEL_ID = "floating_memo_foreground"
     private const val NOTIFICATION_ID = 47001
+    private const val CLOSE_REQUEST_CODE = 47003
 
     fun start(context: Context) {
       try {
@@ -92,7 +94,7 @@ class FloatingMemoService : Service() {
       val channel = NotificationChannel(
         CHANNEL_ID,
         "悬浮备忘",
-        NotificationManager.IMPORTANCE_MIN
+        NotificationManager.IMPORTANCE_LOW
       ).apply {
         setShowBadge(false)
         description = "悬浮气泡运行时常驻，用于保持气泡不被系统回收"
@@ -110,11 +112,32 @@ class FloatingMemoService : Service() {
       @Suppress("DEPRECATION")
       Notification.Builder(this)
     }
+
+    val bigText =
+      "【使用须知】请勿在后台强制划掉本 App，否则悬浮窗将失效。" +
+        "【隐私声明】本 App 无网络权限，所有数据保存在手机本地，绝不泄露。"
+
     return builder
-      .setContentTitle("悬浮备忘录")
-      .setContentText("悬浮气泡运行中，点气泡即可随手记，长按可关闭")
+      .setContentTitle("\uD83D\uDFE3 悬浮备忘录运行中")
+      .setContentText("点击气泡随手记，数据纯本地且无网。")
+      .setStyle(Notification.BigTextStyle().bigText(bigText))
       .setSmallIcon(android.R.drawable.ic_menu_edit)
       .setOngoing(true)
+      .setOnlyAlertOnce(true)
+      .addAction(
+        Notification.Action.Builder(
+          android.R.drawable.ic_menu_close_clear_cancel,
+          "关闭悬浮窗",
+          closePendingIntent()
+        ).build()
+      )
       .build()
+  }
+
+  private fun closePendingIntent(): PendingIntent {
+    val intent = Intent(this, CloseOverlayReceiver::class.java)
+    val flags = PendingIntent.FLAG_UPDATE_CURRENT or
+      (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
+    return PendingIntent.getBroadcast(this, CLOSE_REQUEST_CODE, intent, flags)
   }
 }

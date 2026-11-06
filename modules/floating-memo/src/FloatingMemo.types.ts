@@ -10,9 +10,27 @@ export type FloatingMemoDismissEvent = {
   reason: string;
 };
 
+export type FloatingMemoUndoEvent = {
+  /** 撤回来源，例如 undoButton（输入框顶部按钮） */
+  reason: string;
+};
+
+export type FloatingMemoClipboardEvent = {
+  /** 已过滤（去验证码）的剪贴板文本 */
+  text: string;
+};
+
+export type FloatingMemoAutoSleepEvent = {
+  /** 休眠原因，例如 idle（闲置超时） */
+  reason: string;
+};
+
 export type FloatingMemoEvents = {
   onSave(event: FloatingMemoSaveEvent): void;
   onDismiss(event: FloatingMemoDismissEvent): void;
+  onUndo(event: FloatingMemoUndoEvent): void;
+  onClipboard(event: FloatingMemoClipboardEvent): void;
+  onAutoSleep(event: FloatingMemoAutoSleepEvent): void;
 };
 
 export type FloatingMemoNativeModule = {
@@ -26,10 +44,20 @@ export type FloatingMemoNativeModule = {
   isShowing(): Promise<boolean>;
   /** 设置悬浮输入框是否为深色 */
   setDarkMode(dark: boolean): Promise<void>;
-  /** 订阅「快速保存」/「长按关闭」事件 */
+  /** 设置闲置自动关闭时长（分钟，0 表示永不） */
+  setIdleTimeout(minutes: number): Promise<void>;
+  /** 自动记录成功后的气泡微反馈 */
+  flashBubble(): Promise<void>;
+  /** 开始监听剪贴板变化 */
+  startClipboardWatcher(): Promise<void>;
+  /** 停止监听剪贴板变化 */
+  stopClipboardWatcher(): Promise<void>;
+  /** 订阅事件（onSave / onDismiss / onUndo / onClipboard） */
   addListener(
-    event: 'onSave' | 'onDismiss',
-    listener: (event: FloatingMemoSaveEvent | FloatingMemoDismissEvent) => void,
+    event: 'onSave' | 'onDismiss' | 'onUndo' | 'onClipboard' | 'onAutoSleep',
+    listener: (event: unknown) => void,
   ): { remove(): void };
-  removeAllListeners(event: 'onSave' | 'onDismiss'): void;
+  removeAllListeners(
+    event: 'onSave' | 'onDismiss' | 'onUndo' | 'onClipboard' | 'onAutoSleep',
+  ): void;
 };

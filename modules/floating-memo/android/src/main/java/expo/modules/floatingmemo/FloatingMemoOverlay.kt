@@ -1,5 +1,7 @@
 package expo.modules.floatingmemo
 
+import android.app.AlarmManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
@@ -24,6 +26,7 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 
 /**
  * 管理悬浮小气泡 + 快速输入浮层。
@@ -33,7 +36,9 @@ import android.widget.TextView
 class FloatingMemoOverlay(
   private val context: Context,
   private val onSave: (String) -> Unit,
-  private val onDismiss: () -> Unit
+  private val onDismiss: () -> Unit,
+  private val onUndo: () -> Unit,
+  private val onAutoSleep: () -> Unit
 ) {
   companion object {
     private const val PREFS = "floating_memo_overlay"
@@ -45,6 +50,11 @@ class FloatingMemoOverlay(
 
     private const val GRADIENT_START = "#8E86FF"
     private const val GRADIENT_END = "#5A50E6"
+
+    /** 默认闲置时长：30 分钟（可由 JS 通过 setIdleTimeout 覆盖，0 表示永不） */
+    private const val DEFAULT_IDLE_MS = 30 * 60 * 1000L
+    private const val SLEEP_REQUEST_CODE = 47002
+    private const val KEY_AUTO_SLEPT = "auto_slept"
   }
 
   private val windowManager: WindowManager =
@@ -60,6 +70,7 @@ class FloatingMemoOverlay(
 
   @Volatile private var showing = false
   @Volatile private var darkMode = false
+  @Volatile private var idleTimeoutMs = DEFAULT_IDLE_MS
 
   private var lastX = prefs.getInt(KEY_X, screenWidth() - dp(BUBBLE_SIZE_DP + BUBBLE_MARGIN_DP * 2))
   private var lastY = prefs.getInt(KEY_Y, dp(200))
@@ -95,20 +106,109 @@ class FloatingMemoOverlay(
     darkMode = dark
   }
 
+  /** 自动记录成功时，让气泡轻微脉冲一下作为反馈 */
+  fun flashBubble() {
+    mainHandler.post {
+      val view = bubbleView ?: return@post
+      view.animate()
+        .scaleX(1.12f)
+        .scaleY(1.12f)
+        .setDuration(120L)
+        .withEndAction {
+          view.animate().scaleX(1f).scaleY(1f).setDuration(220L).start()
+        }
+        .start()
+    }
+  }
+
   fun show() {
     if (showing) return
     showing = true
     mainHandler.post { addBubble() }
+    resetAutoSleep()
   }
 
   fun hide() {
     showing = false
+    cancelAutoSleep()
     FloatingMemoService.stop(context)
     mainHandler.post { removeAll() }
   }
 
   fun destroy() {
     hide()
+  }
+
+  // ---- 闲置自动休眠（AlarmManager，熄屏/Doze 下依然会触发） ----
+
+  /** 设置闲置时长（分钟，0 表示永不自动关闭） */
+  fun setIdleTimeout(minutes: Int) {
+    idleTimeoutMs = if (minutes <= 0) 0L else minutes * 60 * 1000L
+    if (showing) {
+      if (idleTimeoutMs <= 0) cancelAutoSleep() else resetAutoSleep()
+    }
+  }
+
+  /** 用户有任何动作时调用，重新开始计时 */
+  fun resetAutoSleep() {
+    if (!showing) return
+    if (idleTimeoutMs <= 0) {
+      cancelAutoSleep()
+      return
+    }
+    try {
+      val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+      val pi = sleepPendingIntent()
+      am.cancel(pi)
+      val triggerAt = System.currentTimeMillis() + idleTimeoutMs
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        if (am.canScheduleExactAlarms()) {
+          am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi)
+        } else {
+          am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi)
+        }
+      } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi)
+      } else {
+        @Suppress("DEPRECATION")
+        am.setExact(AlarmManager.RTC_WAKEUP, triggerAt, pi)
+      }
+    } catch (_: Exception) {
+      // 某些 ROM 限制闹钟，忽略即可，不影响悬浮窗
+    }
+  }
+
+  private fun cancelAutoSleep() {
+    try {
+      val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+      am.cancel(sleepPendingIntent())
+    } catch (_: Exception) {
+      // 忽略
+    }
+  }
+
+  private fun sleepPendingIntent(): PendingIntent {
+    val intent = Intent(context, AutoSleepReceiver::class.java)
+    val flags = PendingIntent.FLAG_UPDATE_CURRENT or
+      (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
+    return PendingIntent.getBroadcast(context, SLEEP_REQUEST_CODE, intent, flags)
+  }
+
+  /** 闲置超时：先彻底移除悬浮视图，再关闭前台服务 */
+  fun autoSleep() {
+    showing = false
+    cancelAutoSleep()
+    mainHandler.post {
+      hideBubble()
+      closeInput()
+      FloatingMemoService.stop(context)
+      try {
+        prefs.edit().putBoolean(KEY_AUTO_SLEPT, true).apply()
+      } catch (_: Exception) {
+        // 忽略
+      }
+      onAutoSleep()
+    }
   }
 
   // ---- 气泡 ----
@@ -186,6 +286,7 @@ class FloatingMemoOverlay(
         .start()
       // 启动前台服务，降低切到其他 App 时被系统回收的概率
       FloatingMemoService.start(context)
+      resetAutoSleep()
     } catch (_: Exception) {
       bubbleView = null
       bubbleParams = null
@@ -217,6 +318,7 @@ class FloatingMemoOverlay(
           moved = false
           dismissing = false
           cancelLongPress()
+          resetAutoSleep()
           // 长按 520ms 且未移动 → 关闭悬浮窗（带缩小淡出动画）
           val runnable = Runnable {
             if (!moved && bubbleView === bubble) {
@@ -289,6 +391,7 @@ class FloatingMemoOverlay(
   private fun dismissBubbleWithAnimation() {
     val view = bubbleView ?: return
     showing = false
+    cancelAutoSleep()
     view.animate()
       .scaleX(0.2f)
       .scaleY(0.2f)
@@ -309,6 +412,7 @@ class FloatingMemoOverlay(
 
   private fun openInput() {
     if (inputView != null) return
+    resetAutoSleep()
     hideBubble()
 
     val root = buildInputOverlay()
@@ -409,6 +513,34 @@ class FloatingMemoOverlay(
       setTextColor(fg)
     }
 
+    // 撤回最新一条（放在顶部显眼位置）
+    val undo = TextView(context).apply {
+      text = "↩ 撤回最新"
+      textSize = 13f
+      setTextColor(Color.parseColor(GRADIENT_START))
+      setPadding(dp(10), dp(6), dp(10), dp(6))
+      setOnClickListener {
+        onUndo()
+        try {
+          Toast.makeText(context, "已撤回", Toast.LENGTH_SHORT).show()
+        } catch (_: Exception) {
+          // 忽略
+        }
+        // 撤回后自动收起输入面板，回到气泡
+        closeInput()
+      }
+    }
+
+    val header = LinearLayout(context).apply {
+      orientation = LinearLayout.HORIZONTAL
+      gravity = Gravity.CENTER_VERTICAL
+    }
+    header.addView(
+      title,
+      LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+    )
+    header.addView(undo)
+
     val edit = EditText(context).apply {
       hint = "想到什么，写下来…"
       setTextColor(fg)
@@ -466,7 +598,7 @@ class FloatingMemoOverlay(
     btnRow.addView(cancel)
     btnRow.addView(save)
 
-    card.addView(title)
+    card.addView(header)
     card.addView(
       edit,
       LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
