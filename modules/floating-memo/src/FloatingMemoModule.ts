@@ -9,11 +9,6 @@ declare class FloatingMemoModule extends NativeModule<FloatingMemoEvents> {
   hide(): Promise<void>;
   isShowing(): Promise<boolean>;
   setDarkMode(dark: boolean): Promise<void>;
-  setIdleTimeout(minutes: number): Promise<void>;
-  flashBubble(): Promise<void>;
-  startClipboardWatcher(): Promise<void>;
-  stopClipboardWatcher(): Promise<void>;
 }
 
-// 在 Web 平台上会解析到 FloatingMemoModule.web.ts（空实现），原生平台则解析到真实模块。
 export default requireNativeModule<FloatingMemoModule>('FloatingMemo');

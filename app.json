@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "悬浮备忘录",
+    "name": "悬浮便签 Lite",
     "slug": "floating-memo",
     "version": "3.5.0",
     "orientation": "portrait",
@@ -8,13 +8,13 @@
     "userInterfaceStyle": "automatic",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.floatingmemo.app"
+      "bundleIdentifier": "com.floatingmemo.lite"
     },
     "android": {
-      "package": "com.floatingmemo.app",
-      "versionCode": 9,
+      "package": "com.floatingmemo.lite",
+      "versionCode": 1,
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#23262F",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"

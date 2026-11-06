@@ -10,7 +10,7 @@ import android.content.Intent
 class CloseOverlayReceiver : BroadcastReceiver() {
   override fun onReceive(context: Context?, intent: Intent?) {
     try {
-      FloatingMemoSleepBridge.triggerClose()
+      FloatingMemoActionBridge.triggerClose()
     } catch (_: Exception) {
       // 忽略
     }

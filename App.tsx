@@ -1,7 +1,6 @@
 import { StatusBar } from 'expo-status-bar';
 import * as Clipboard from 'expo-clipboard';
 import Constants from 'expo-constants';
-import Slider from '@react-native-community/slider';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
@@ -24,21 +23,15 @@ import FloatingMemo from './modules/floating-memo';
 import MemoItem from './src/components/MemoItem';
 import SwipeableRow from './src/components/SwipeableRow';
 import {
-  loadAutoClipboard,
   loadFloatingEnabled,
-  loadIdleMinutes,
   loadIgnoredVersion,
   loadMemos,
-  loadPrivacyMode,
   loadThemeMode,
   prependMemo,
   removeLatestMemo,
-  saveAutoClipboard,
   saveFloatingEnabled,
-  saveIdleMinutes,
   saveIgnoredVersion,
   saveMemos,
-  savePrivacyMode,
   saveThemeMode,
 } from './src/storage';
 import {
@@ -49,9 +42,6 @@ import {
   type ThemeMode,
 } from './src/theme';
 import type { Memo } from './src/types';
-
-const IDLE_MIN = 1;
-const IDLE_MAX = 120;
 
 function parseVersion(v: string): number[] | null {
   const m = v.trim().replace(/^v/i, '').match(/^(\d+)\.(\d+)\.(\d+)/);
@@ -65,8 +55,6 @@ function compareVersion(a: number[], b: number[]): number {
   return 0;
 }
 
-// Android 13+ 需要通知权限，前台服务的常驻通知才能显示。
-// 即使未授权，前台服务仍可运行（只是通知不可见），因此这里不影响主流程。
 async function ensureNotificationPermission() {
   if (Platform.OS !== 'android') return;
   if (Number(Platform.Version) < 33) return;
@@ -82,14 +70,9 @@ export default function App() {
   const [memos, setMemos] = useState<Memo[]>([]);
   const [floatingEnabled, setFloatingEnabled] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>('system');
-  const [privacyMode, setPrivacyMode] = useState(false);
-  const [autoClipboard, setAutoClipboard] = useState(false);
-  const [idleMinutes, setIdleMinutes] = useState(30);
-  const [revealed, setRevealed] = useState<Set<string>>(new Set());
   const [loaded, setLoaded] = useState(false);
 
   const pendingEnableRef = useRef(false);
-  const lastClipboardRef = useRef('');
 
   const palette = useMemo(
     () => resolvePalette(themeMode, systemScheme),
@@ -107,7 +90,7 @@ export default function App() {
     return [...active, ...done];
   }, [memos]);
 
-  // 持久化做防抖：避免连续剪贴板事件频繁写盘造成卡顿
+  // 持久化防抖
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingSaveRef = useRef<Memo[] | null>(null);
   const persistMemos = useCallback((list: Memo[]) => {
@@ -121,7 +104,6 @@ export default function App() {
     }, 300);
   }, []);
 
-  // 离开时把未落盘的数据写掉
   useEffect(() => {
     return () => {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
@@ -194,34 +176,7 @@ export default function App() {
     await Clipboard.setStringAsync(text);
   }, []);
 
-  // 单条明文/打码切换
-  const toggleReveal = useCallback((id: string) => {
-    setRevealed((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }, []);
-
-  // 剪贴板文本统一处理：防重复 + 过滤验证码 + 查重保存 + 气泡反馈
-  const handleClipboardText = useCallback(
-    (raw: string) => {
-      const text = raw.trim();
-      if (!text) return;
-      // 防死循环：与上一次处理的完全相同就直接跳过
-      if (text === lastClipboardRef.current) return;
-      lastClipboardRef.current = text;
-      // 延后一帧再处理，避免阻塞当前 UI
-      setTimeout(() => {
-        addMemo(text, 'clipboard');
-        FloatingMemo.flashBubble().catch(() => {});
-      }, 0);
-    },
-    [addMemo],
-  );
-
-  // 悬浮窗「快速保存」事件
+  // 悬浮窗「快速保存」
   useEffect(() => {
     const sub = FloatingMemo.addListener('onSave', (e) => {
       addMemo(e.text);
@@ -229,7 +184,7 @@ export default function App() {
     return () => sub.remove();
   }, [addMemo]);
 
-  // 长按气泡关闭悬浮窗后，同步把开关置为关闭
+  // 关闭悬浮窗（长按 / 通知按钮）后同步开关
   useEffect(() => {
     const sub = FloatingMemo.addListener('onDismiss', () => {
       setFloatingEnabled(false);
@@ -238,7 +193,7 @@ export default function App() {
     return () => sub.remove();
   }, []);
 
-  // 悬浮窗「撤回最新」按钮
+  // 悬浮窗「撤回最新」
   useEffect(() => {
     const sub = FloatingMemo.addListener('onUndo', () => {
       undoLatest();
@@ -246,54 +201,17 @@ export default function App() {
     return () => sub.remove();
   }, [undoLatest]);
 
-  // 原生剪贴板监听事件
-  useEffect(() => {
-    const sub = FloatingMemo.addListener('onClipboard', (e) => {
-      handleClipboardText(e.text);
-    });
-    return () => sub.remove();
-  }, [handleClipboardText]);
-
-  // 闲置超时自动休眠后，同步关闭主界面开关
-  useEffect(() => {
-    const sub = FloatingMemo.addListener('onAutoSleep', () => {
-      setFloatingEnabled(false);
-      saveFloatingEnabled(false);
-    });
-    return () => sub.remove();
-  }, []);
-
-  // 首次加载本地数据
+  // 首次加载
   useEffect(() => {
     (async () => {
-      const [m, f, t, p, a, idle] = await Promise.all([
+      const [m, f, t] = await Promise.all([
         loadMemos(),
         loadFloatingEnabled(),
         loadThemeMode(),
-        loadPrivacyMode(),
-        loadAutoClipboard(),
-        loadIdleMinutes(),
       ]);
       setMemos(m);
       setThemeMode(t);
-      setPrivacyMode(p);
-      setAutoClipboard(a);
-      setIdleMinutes(idle);
       setLoaded(true);
-
-      try {
-        await FloatingMemo.setIdleTimeout(idle);
-      } catch {
-        // 忽略
-      }
-
-      if (a) {
-        try {
-          await FloatingMemo.startClipboardWatcher();
-        } catch {
-          // 忽略
-        }
-      }
 
       if (f) {
         await ensureNotificationPermission();
@@ -304,7 +222,46 @@ export default function App() {
     })();
   }, []);
 
-  // 佛系更新检查（force=true 时无视「别来烦我」记录）
+  // 主题变化
+  useEffect(() => {
+    saveThemeMode(themeMode);
+    FloatingMemo.setDarkMode(isDark).catch(() => {});
+  }, [themeMode, isDark]);
+
+  // 从授权页返回后自动开启
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state !== 'active' || !pendingEnableRef.current) return;
+      pendingEnableRef.current = false;
+      (async () => {
+        if (await FloatingMemo.hasOverlayPermission()) {
+          await ensureNotificationPermission();
+          const ok = await FloatingMemo.show();
+          setFloatingEnabled(ok);
+          if (ok) await saveFloatingEnabled(true);
+        }
+      })();
+    });
+    return () => sub.remove();
+  }, []);
+
+  // 回到前台时对齐真实状态
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', async (state) => {
+      if (state !== 'active') return;
+      try {
+        if (floatingEnabled && !(await FloatingMemo.isShowing())) {
+          setFloatingEnabled(false);
+          saveFloatingEnabled(false);
+        }
+      } catch {
+        // 忽略
+      }
+    });
+    return () => sub.remove();
+  }, [floatingEnabled]);
+
+  // 佛系更新检查
   const checkingRef = useRef(false);
   const checkUpdate = useCallback(async (force: boolean) => {
     if (checkingRef.current) return;
@@ -348,65 +305,15 @@ export default function App() {
         },
       ]);
     } catch {
-      // 无网络 / API 失败：静默处理，绝不打扰
+      // 无网络 / API 失败：静默
     } finally {
       checkingRef.current = false;
     }
   }, []);
 
-  // 启动时静默检查一次
   useEffect(() => {
     checkUpdate(false);
   }, [checkUpdate]);
-
-  // 主题变化：持久化 + 同步原生浮层深浅色
-  useEffect(() => {
-    saveThemeMode(themeMode);
-    FloatingMemo.setDarkMode(isDark).catch(() => {});
-  }, [themeMode, isDark]);
-
-  // 从系统授权页返回后，若用户曾想开启悬浮窗，则自动开启
-  useEffect(() => {
-    const sub = AppState.addEventListener('change', (state) => {
-      if (state !== 'active' || !pendingEnableRef.current) return;
-      pendingEnableRef.current = false;
-      (async () => {
-        if (await FloatingMemo.hasOverlayPermission()) {
-          await ensureNotificationPermission();
-          const ok = await FloatingMemo.show();
-          setFloatingEnabled(ok);
-          if (ok) await saveFloatingEnabled(true);
-        }
-      })();
-    });
-    return () => sub.remove();
-  }, []);
-
-  // 回到前台：对齐悬浮窗真实状态 + 补读一次剪贴板
-  useEffect(() => {
-    const sub = AppState.addEventListener('change', async (state) => {
-      if (state !== 'active') return;
-
-      // 自动休眠 / 进程被回收后，把 UI 开关同步成真实状态
-      try {
-        if (floatingEnabled && !(await FloatingMemo.isShowing())) {
-          setFloatingEnabled(false);
-          saveFloatingEnabled(false);
-        }
-      } catch {
-        // 忽略
-      }
-
-      if (!autoClipboard) return;
-      try {
-        const text = await Clipboard.getStringAsync();
-        if (text) handleClipboardText(text);
-      } catch {
-        // 读取被系统拒绝时静默失败
-      }
-    });
-    return () => sub.remove();
-  }, [autoClipboard, handleClipboardText, floatingEnabled]);
 
   const toggleFloating = useCallback(async (next: boolean) => {
     if (!next) {
@@ -431,29 +338,6 @@ export default function App() {
     }
   }, []);
 
-  const togglePrivacy = useCallback((next: boolean) => {
-    setPrivacyMode(next);
-    savePrivacyMode(next);
-    setRevealed(new Set());
-  }, []);
-
-  const toggleAutoClipboard = useCallback(async (next: boolean) => {
-    setAutoClipboard(next);
-    saveAutoClipboard(next);
-    try {
-      if (next) await FloatingMemo.startClipboardWatcher();
-      else await FloatingMemo.stopClipboardWatcher();
-    } catch {
-      // 忽略
-    }
-  }, []);
-
-  const changeIdle = useCallback((minutes: number) => {
-    setIdleMinutes(minutes);
-    saveIdleMinutes(minutes);
-    FloatingMemo.setIdleTimeout(minutes).catch(() => {});
-  }, []);
-
   const cycleTheme = useCallback(() => {
     setThemeMode((prev) => {
       const idx = THEME_CYCLE.indexOf(prev);
@@ -469,8 +353,8 @@ export default function App() {
 
       <View style={[styles.header, { paddingTop: topInset + 12 }]}>
         <View>
-          <Text style={[styles.title, { color: palette.text }]}>悬浮备忘录</Text>
-          <Text style={[styles.subtitle, { color: palette.textSecondary }]}>想到什么，随手记</Text>
+          <Text style={[styles.title, { color: palette.text }]}>悬浮便签 Lite</Text>
+          <Text style={[styles.subtitle, { color: palette.textSecondary }]}>只留最纯粹的随手记</Text>
         </View>
         <Pressable
           onPress={cycleTheme}
@@ -514,64 +398,6 @@ export default function App() {
 
               <View style={[styles.divider, { backgroundColor: palette.border }]} />
 
-              <View style={styles.toggleRow}>
-                <View style={styles.toggleTextWrap}>
-                  <Text style={[styles.toggleTitle, { color: palette.text }]}>隐私保护</Text>
-                  <Text style={[styles.toggleDesc, { color: palette.textSecondary }]}>
-                    列表内容默认打码，点每条右侧的小眼睛查看
-                  </Text>
-                </View>
-                <Switch
-                  value={privacyMode}
-                  onValueChange={togglePrivacy}
-                  trackColor={{ false: palette.border, true: palette.accent }}
-                  thumbColor="#FFFFFF"
-                />
-              </View>
-
-              <View style={[styles.divider, { backgroundColor: palette.border }]} />
-
-              <View style={styles.toggleRow}>
-                <View style={styles.toggleTextWrap}>
-                  <Text style={[styles.toggleTitle, { color: palette.text }]}>自动记录剪贴板</Text>
-                  <Text style={[styles.toggleDesc, { color: palette.textSecondary }]}>
-                    复制文字后自动存一条（自动跳过验证码）
-                  </Text>
-                </View>
-                <Switch
-                  value={autoClipboard}
-                  onValueChange={toggleAutoClipboard}
-                  trackColor={{ false: palette.border, true: palette.accent }}
-                  thumbColor="#FFFFFF"
-                />
-              </View>
-
-              <View style={[styles.divider, { backgroundColor: palette.border }]} />
-
-              <View style={styles.idleHeader}>
-                <Text style={[styles.toggleTitle, { color: palette.text }]}>
-                  闲置自动关闭（省电）
-                </Text>
-                <Text style={[styles.idleValue, { color: palette.accent }]}>
-                  {idleMinutes} 分钟
-                </Text>
-              </View>
-              <Text style={[styles.toggleDesc, { color: palette.textSecondary }]}>
-                拖动滑块设置 1–120 分钟；悬浮窗开着但长时间没操作时自动收起
-              </Text>
-              <Slider
-                style={styles.slider}
-                minimumValue={IDLE_MIN}
-                maximumValue={IDLE_MAX}
-                step={1}
-                value={idleMinutes}
-                onValueChange={(v) => setIdleMinutes(Math.round(v))}
-                onSlidingComplete={(v) => changeIdle(Math.round(v))}
-                minimumTrackTintColor={palette.accent}
-                maximumTrackTintColor={palette.border}
-                thumbTintColor={palette.accent}
-              />
-
               <Pressable
                 onPress={() => checkUpdate(true)}
                 style={({ pressed }) => [
@@ -592,28 +418,25 @@ export default function App() {
             </Text>
           </View>
         }
-        renderItem={({ item }) => {
-          const maskable = privacyMode && item.source !== 'manual';
-          return (
-            <SwipeableRow
-              actionLabel="☐ 设为待办"
-              onAction={() => setTodo(item.id)}
-              enabled={!item.isTodo}
+        renderItem={({ item }) => (
+          <SwipeableRow
+            actionLabel="☐ 设为待办"
+            onAction={() => setTodo(item.id)}
+            enabled={!item.isTodo}
+            palette={palette}
+          >
+            <MemoItem
+              memo={item}
               palette={palette}
-            >
-              <MemoItem
-                memo={item}
-                palette={palette}
-                maskable={maskable}
-                masked={maskable && !revealed.has(item.id)}
-                onToggleReveal={() => toggleReveal(item.id)}
-                onToggleDone={() => toggleDone(item.id)}
-                onCopy={copyMemo}
-                onDelete={deleteMemo}
-              />
-            </SwipeableRow>
-          );
-        }}
+              maskable={false}
+              masked={false}
+              onToggleReveal={() => {}}
+              onToggleDone={() => toggleDone(item.id)}
+              onCopy={copyMemo}
+              onDelete={deleteMemo}
+            />
+          </SwipeableRow>
+        )}
         ListEmptyComponent={
           loaded ? (
             <View style={styles.empty}>
@@ -690,28 +513,7 @@ const styles = StyleSheet.create({
     height: StyleSheet.hairlineWidth,
     marginVertical: 14,
   },
-  segRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-    marginTop: 10,
-  },
-  idleHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  idleValue: {
-    fontSize: 15,
-    fontWeight: '700',
-  },
-  slider: {
-    width: '100%',
-    height: 40,
-    marginTop: 4,
-  },
   updateBtn: {
-    marginTop: 12,
     paddingVertical: 12,
     borderRadius: 14,
     borderWidth: StyleSheet.hairlineWidth,
@@ -719,15 +521,6 @@ const styles = StyleSheet.create({
   },
   updateBtnText: {
     fontSize: 15,
-    fontWeight: '600',
-  },
-  segItem: {
-    paddingHorizontal: 13,
-    paddingVertical: 7,
-    borderRadius: 14,
-  },
-  segText: {
-    fontSize: 13,
     fontWeight: '600',
   },
   sectionTitle: {
