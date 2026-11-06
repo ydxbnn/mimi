@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "悬浮备忘录",
+    "slug": "floating-memo",
+    "version": "2.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.floatingmemo.app"
+    },
+    "android": {
+      "package": "com.floatingmemo.app",
+      "versionCode": 2,
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "permissions": ["android.permission.SYSTEM_ALERT_WINDOW"]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    }
+  }
+}
