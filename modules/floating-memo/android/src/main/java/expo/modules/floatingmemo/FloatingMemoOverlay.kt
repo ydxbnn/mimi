@@ -366,7 +366,7 @@ class FloatingMemoOverlay(
           }
           else -> true
         }
-        return@setOnTouchListener
+        return@setOnTouchListener true
       }
 
       when (event.actionMasked) {
