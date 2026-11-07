@@ -30,8 +30,10 @@ import android.widget.Toast
 
 /**
  * 管理悬浮小气泡 + 快速输入浮层。
- * 所有 View 均通过 WindowManager 以 TYPE_APPLICATION_OVERLAY 添加，
- * 因此可以悬浮在其他应用（浏览器、聊天等）之上。
+ * 所有 View 均通过 WindowManager 以 TYPE_APPLICATION_OVERLAY 添加。
+ *
+ * 交互：静止 8 秒后自动滑入屏幕边缘，只留一条半透明小把手；点一下把手即可展开，
+ * 无需回到 App 重新开启。
  */
 class FloatingMemoOverlay(
   private val context: Context,
@@ -51,6 +53,12 @@ class FloatingMemoOverlay(
     private const val GRADIENT_START = "#8E86FF"
     private const val GRADIENT_END = "#5A50E6"
 
+    /** 静止多久后贴边收起 */
+    private const val COLLAPSE_DELAY_MS = 8000L
+    private const val HANDLE_W_DP = 18
+    private const val HANDLE_H_DP = 44
+    private const val HANDLE_ALPHA = 0.55f
+
     /** 默认闲置时长：30 分钟（可由 JS 通过 setIdleTimeout 覆盖，0 表示永不） */
     private const val DEFAULT_IDLE_MS = 30 * 60 * 1000L
     private const val SLEEP_REQUEST_CODE = 47002
@@ -63,6 +71,8 @@ class FloatingMemoOverlay(
   private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
   private var bubbleView: View? = null
+  private var bubbleGroup: View? = null
+  private var handleView: View? = null
   private var inputView: View? = null
   private var bubbleParams: WindowManager.LayoutParams? = null
   private var inputCard: View? = null
@@ -71,6 +81,10 @@ class FloatingMemoOverlay(
   @Volatile private var showing = false
   @Volatile private var darkMode = false
   @Volatile private var idleTimeoutMs = DEFAULT_IDLE_MS
+  @Volatile private var collapsed = false
+  @Volatile private var dockedLeft = false
+
+  private var collapseRunnable: Runnable? = null
 
   private var lastX = prefs.getInt(KEY_X, screenWidth() - dp(BUBBLE_SIZE_DP + BUBBLE_MARGIN_DP * 2))
   private var lastY = prefs.getInt(KEY_Y, dp(200))
@@ -109,6 +123,7 @@ class FloatingMemoOverlay(
   /** 自动记录成功时，让气泡轻微脉冲一下作为反馈 */
   fun flashBubble() {
     mainHandler.post {
+      if (collapsed) return@post
       val view = bubbleView ?: return@post
       view.animate()
         .scaleX(1.12f)
@@ -130,6 +145,7 @@ class FloatingMemoOverlay(
 
   fun hide() {
     showing = false
+    cancelCollapse()
     cancelAutoSleep()
     FloatingMemoService.stop(context)
     mainHandler.post { removeAll() }
@@ -197,6 +213,7 @@ class FloatingMemoOverlay(
   /** 闲置超时：先彻底移除悬浮视图，再关闭前台服务 */
   fun autoSleep() {
     showing = false
+    cancelCollapse()
     cancelAutoSleep()
     mainHandler.post {
       hideBubble()
@@ -222,15 +239,16 @@ class FloatingMemoOverlay(
     val windowSize = bubbleSize + margin * 2
 
     val container = FrameLayout(context)
+    val group = FrameLayout(context)
 
-    // 阴影层：略大且向下偏移的半透明椭圆，模拟柔和投影（避免 elevation 在悬浮窗内被裁掉）
+    // 阴影层：略大且向下偏移的半透明椭圆，模拟柔和投影
     val shadow = View(context).apply {
       background = GradientDrawable().apply {
         shape = GradientDrawable.OVAL
         setColor(Color.parseColor("#2E000000"))
       }
     }
-    container.addView(
+    group.addView(
       shadow,
       FrameLayout.LayoutParams(bubbleSize, bubbleSize, Gravity.CENTER).apply {
         topMargin = dp(4)
@@ -252,7 +270,23 @@ class FloatingMemoOverlay(
         setStroke(dp(2), Color.parseColor("#40FFFFFF"))
       }
     }
-    container.addView(bubble, FrameLayout.LayoutParams(bubbleSize, bubbleSize, Gravity.CENTER))
+    group.addView(bubble, FrameLayout.LayoutParams(bubbleSize, bubbleSize, Gravity.CENTER))
+    container.addView(group, FrameLayout.LayoutParams(windowSize, windowSize))
+
+    // 贴边收起后的小把手
+    val handle = View(context).apply {
+      background = GradientDrawable().apply {
+        cornerRadius = dp(HANDLE_W_DP / 2).toFloat()
+        setColor(Color.parseColor(GRADIENT_START))
+        setStroke(dp(1), Color.parseColor("#40FFFFFF"))
+      }
+      alpha = HANDLE_ALPHA
+      visibility = View.GONE
+    }
+    container.addView(
+      handle,
+      FrameLayout.LayoutParams(dp(HANDLE_W_DP), dp(HANDLE_H_DP))
+    )
 
     val params = WindowManager.LayoutParams(
       windowSize,
@@ -266,15 +300,18 @@ class FloatingMemoOverlay(
       y = clampY(lastY)
     }
 
-    attachDrag(container, params)
+    bubbleView = container
+    bubbleGroup = group
+    handleView = handle
+    bubbleParams = params
+    collapsed = false
 
-    // 出现动画：缩放 0.2 → 1 + 淡入，带轻微回弹
+    attachTouch(container, params)
+
     container.scaleX = 0.2f
     container.scaleY = 0.2f
     container.alpha = 0f
 
-    bubbleView = container
-    bubbleParams = params
     try {
       windowManager.addView(container, params)
       container.animate()
@@ -284,16 +321,18 @@ class FloatingMemoOverlay(
         .setDuration(260L)
         .setInterpolator(OvershootInterpolator(1.4f))
         .start()
-      // 启动前台服务，降低切到其他 App 时被系统回收的概率
       FloatingMemoService.start(context)
       resetAutoSleep()
+      scheduleCollapse()
     } catch (_: Exception) {
       bubbleView = null
+      bubbleGroup = null
+      handleView = null
       bubbleParams = null
     }
   }
 
-  private fun attachDrag(bubble: View, params: WindowManager.LayoutParams) {
+  private fun attachTouch(container: View, params: WindowManager.LayoutParams) {
     val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
     var downRawX = 0f
     var downRawY = 0f
@@ -304,11 +343,32 @@ class FloatingMemoOverlay(
     var longPress: Runnable? = null
 
     fun cancelLongPress() {
-      longPress?.let { bubble.removeCallbacks(it) }
+      longPress?.let { container.removeCallbacks(it) }
       longPress = null
     }
 
-    bubble.setOnTouchListener { _, event ->
+    container.setOnTouchListener { _, event ->
+      // 收起状态：只响应「点一下展开」
+      if (collapsed) {
+        when (event.actionMasked) {
+          MotionEvent.ACTION_DOWN -> {
+            downRawX = event.rawX
+            downRawY = event.rawY
+            true
+          }
+          MotionEvent.ACTION_UP -> {
+            val dx = event.rawX - downRawX
+            val dy = event.rawY - downRawY
+            if (Math.hypot(dx.toDouble(), dy.toDouble()) < touchSlop * 2) {
+              expandFromEdge()
+            }
+            true
+          }
+          else -> true
+        }
+        return@setOnTouchListener
+      }
+
       when (event.actionMasked) {
         MotionEvent.ACTION_DOWN -> {
           downRawX = event.rawX
@@ -318,16 +378,17 @@ class FloatingMemoOverlay(
           moved = false
           dismissing = false
           cancelLongPress()
+          cancelCollapse()
           resetAutoSleep()
-          // 长按 520ms 且未移动 → 关闭悬浮窗（带缩小淡出动画）
+          // 长按 520ms 且未移动 → 关闭悬浮窗
           val runnable = Runnable {
-            if (!moved && bubbleView === bubble) {
+            if (!moved && bubbleView === container && !collapsed) {
               dismissing = true
               dismissBubbleWithAnimation()
             }
           }
           longPress = runnable
-          bubble.postDelayed(runnable, 520L)
+          container.postDelayed(runnable, 520L)
           true
         }
         MotionEvent.ACTION_MOVE -> {
@@ -341,7 +402,7 @@ class FloatingMemoOverlay(
             params.x = startX + dx.toInt()
             params.y = startY + dy.toInt()
             try {
-              windowManager.updateViewLayout(bubble, params)
+              windowManager.updateViewLayout(container, params)
             } catch (_: Exception) {
               // 忽略
             }
@@ -350,11 +411,12 @@ class FloatingMemoOverlay(
         }
         MotionEvent.ACTION_UP -> {
           cancelLongPress()
-          if (!dismissing && bubbleView === bubble) {
+          if (!dismissing && bubbleView === container && !collapsed) {
             if (moved) {
               lastX = params.x
               lastY = params.y
               prefs.edit().putInt(KEY_X, lastX).putInt(KEY_Y, lastY).apply()
+              scheduleCollapse()
             } else {
               openInput()
             }
@@ -370,7 +432,91 @@ class FloatingMemoOverlay(
     }
   }
 
+  // ---- 贴边收起 / 展开 ----
+
+  private fun scheduleCollapse() {
+    cancelCollapse()
+    if (!showing || collapsed) return
+    val runnable = Runnable {
+      if (showing && !collapsed) collapseToEdge()
+    }
+    collapseRunnable = runnable
+    mainHandler.postDelayed(runnable, COLLAPSE_DELAY_MS)
+  }
+
+  private fun cancelCollapse() {
+    collapseRunnable?.let { mainHandler.removeCallbacks(it) }
+    collapseRunnable = null
+  }
+
+  private fun collapseToEdge() {
+    val container = bubbleView ?: return
+    val params = bubbleParams ?: return
+    if (collapsed) return
+
+    cancelCollapse()
+    val windowSize = dp(BUBBLE_SIZE_DP + BUBBLE_MARGIN_DP * 2)
+    val handleW = dp(HANDLE_W_DP)
+    val handleH = dp(HANDLE_H_DP)
+
+    dockedLeft = params.x + windowSize / 2 < screenWidth() / 2
+    val centerY = params.y + windowSize / 2
+
+    params.width = handleW
+    params.height = handleH
+    params.x = if (dockedLeft) 0 else screenWidth() - handleW
+    params.y = (centerY - handleH / 2).coerceIn(0, (screenHeight() - handleH).coerceAtLeast(0))
+
+    bubbleGroup?.visibility = View.GONE
+    handleView?.visibility = View.VISIBLE
+    collapsed = true
+
+    try {
+      windowManager.updateViewLayout(container, params)
+    } catch (_: Exception) {
+      // 忽略
+    }
+    handleView?.alpha = 0f
+    handleView?.animate()?.alpha(HANDLE_ALPHA)?.setDuration(160L)?.start()
+  }
+
+  private fun expandFromEdge() {
+    val container = bubbleView ?: return
+    val params = bubbleParams ?: return
+    if (!collapsed) return
+
+    cancelCollapse()
+    val windowSize = dp(BUBBLE_SIZE_DP + BUBBLE_MARGIN_DP * 2)
+    val handleH = dp(HANDLE_H_DP)
+    val centerY = params.y + handleH / 2
+
+    params.width = windowSize
+    params.height = windowSize
+    params.x = if (dockedLeft) 0 else screenWidth() - windowSize
+    params.y = (centerY - windowSize / 2).coerceIn(0, (screenHeight() - windowSize).coerceAtLeast(0))
+
+    handleView?.visibility = View.GONE
+    bubbleGroup?.visibility = View.VISIBLE
+    collapsed = false
+    lastX = params.x
+    lastY = params.y
+
+    try {
+      windowManager.updateViewLayout(container, params)
+    } catch (_: Exception) {
+      // 忽略
+    }
+
+    container.scaleX = 0.85f
+    container.scaleY = 0.85f
+    container.animate().scaleX(1f).scaleY(1f).setDuration(180L).start()
+
+    resetAutoSleep()
+    scheduleCollapse()
+  }
+
   private fun hideBubble() {
+    cancelCollapse()
     val view = bubbleView ?: return
     try {
       windowManager.removeView(view)
@@ -378,7 +524,10 @@ class FloatingMemoOverlay(
       // 忽略
     }
     bubbleView = null
+    bubbleGroup = null
+    handleView = null
     bubbleParams = null
+    collapsed = false
   }
 
   private fun showBubble() {
@@ -391,6 +540,7 @@ class FloatingMemoOverlay(
   private fun dismissBubbleWithAnimation() {
     val view = bubbleView ?: return
     showing = false
+    cancelCollapse()
     cancelAutoSleep()
     view.animate()
       .scaleX(0.2f)
@@ -412,6 +562,7 @@ class FloatingMemoOverlay(
 
   private fun openInput() {
     if (inputView != null) return
+    cancelCollapse()
     resetAutoSleep()
     hideBubble()
 
@@ -425,7 +576,6 @@ class FloatingMemoOverlay(
     ).apply {
       gravity = Gravity.CENTER
       softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
-      // Android 12+ 给浮层加背景模糊，呈现毛玻璃观感；低版本忽略
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         flags = flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
         blurBehindRadius = dp(18)
@@ -436,7 +586,6 @@ class FloatingMemoOverlay(
       windowManager.addView(root, params)
       inputView = root
 
-      // 浮层淡入 + 卡片轻微放大
       root.alpha = 0f
       root.animate().alpha(1f).setDuration(170L).start()
 
@@ -474,6 +623,7 @@ class FloatingMemoOverlay(
     inputCard = null
     editText = null
     showBubble()
+    scheduleCollapse()
   }
 
   private fun buildInputOverlay(): View {
@@ -492,7 +642,6 @@ class FloatingMemoOverlay(
     }
     root.addView(scrim, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
-    // 圆角 + 半透明「毛玻璃」卡片
     val card = LinearLayout(context).apply {
       orientation = LinearLayout.VERTICAL
       setPadding(dp(20), dp(20), dp(20), dp(16))
@@ -526,7 +675,6 @@ class FloatingMemoOverlay(
         } catch (_: Exception) {
           // 忽略
         }
-        // 撤回后自动收起输入面板，回到气泡
         closeInput()
       }
     }
@@ -571,7 +719,6 @@ class FloatingMemoOverlay(
       setOnClickListener { closeInput() }
     }
 
-    // 药丸状渐变保存按钮
     val save = TextView(context).apply {
       text = "快速保存"
       textSize = 15f
@@ -619,6 +766,7 @@ class FloatingMemoOverlay(
   }
 
   private fun removeAll() {
+    cancelCollapse()
     hideBubble()
     closeInput()
   }
